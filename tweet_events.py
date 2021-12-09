@@ -4,14 +4,13 @@ import argparse
 import json
 import os
 import sys
-import time
 
 import requests
 
 try:
-    import twitter
+    import tweepy
 except ImportError:
-    twitter = None
+    tweepy = None
 
 
 class DatatrackerTracker:
@@ -37,6 +36,7 @@ class DatatrackerTracker:
 
     def run(self):
         last_seen_id = self.get_last_seen()
+        self.note(f"Resuming at event: {last_seen_id}")
         events = self.get_events(last_seen_id)
         new_last_seen = self.process_events(events, last_seen_id)
         self.note(f"Last event seen: {new_last_seen}")
@@ -44,11 +44,10 @@ class DatatrackerTracker:
 
     def process_events(self, events, last_seen_id):
         for event in events:
-            last_seen_id = event["id"]
             if not f"draft-ietf-{self.args.wg}" in event["doc"]:
                 continue
             if self.args.debug:
-                print(f"{event['type']} {event['desc']}")
+                self.note(f"Event: {event['type']} ({event['desc']})")
             template = self.INTERESTING_EVENTS.get(event["type"], None)
             if type(template) is dict:
                 template = template.get(event["desc"], None)
@@ -58,13 +57,13 @@ class DatatrackerTracker:
                 message = self.format_message(event, template)
             except ValueError:
                 break
-            if self.args.dry_run or self.args.debug:
-                print(message)
-            else:
+            self.note(f"Message: {message}")
+            if not self.args.dry_run:
                 try:
                     self.tweet(message)
-                except:
-                    break
+                except tweepy.TweepyException:
+                    break  # didn't tweet so we should bail
+            last_seen_id = event["id"]
         return last_seen_id
 
     def get_events(self, last_seen_id=None):
@@ -85,7 +84,7 @@ class DatatrackerTracker:
             results = self.get_doc(next_link)
             more_events = results["objects"]
             more_events.reverse()
-            events.extend(more_events)
+            events[:0] = more_events
         new_events = [event for event in events if event["id"] > last_seen_id]
         if len(new_events) == len(events) and last_seen_id is not None:
             self.warn(f"Event ID {last_seen_id} not found.")
@@ -101,33 +100,28 @@ class DatatrackerTracker:
         return template.format(**locals())
 
     def init_twitter(self):
-        self.twitter_api = twitter.Api(
-            consumer_key=os.environ["TWITTER_CONSUMER_KEY"],
-            consumer_secret=os.environ["TWITTER_CONSUMER_SECRET"],
-            access_token_key=os.environ["TWITTER_TOKEN_KEY"],
-            access_token_secret=os.environ["TWITTER_TOKEN_SECRET"],
-        )
+        try:
+            self.twitter_api = tweepy.Client(
+                consumer_key=os.environ["TWITTER_CONSUMER_KEY"],
+                consumer_secret=os.environ["TWITTER_CONSUMER_SECRET"],
+                access_token=os.environ["TWITTER_TOKEN_KEY"],
+                access_token_secret=os.environ["TWITTER_TOKEN_SECRET"],
+                wait_on_rate_limit=True,
+            )
+        except KeyError as why:
+            self.error(f"Environment variable not found: {why}")
+        except tweepy.TweepyException as why:
+            self.error(str(why))
 
-    def tweet(self, message, retry_count=0):
+    def tweet(self, message):
         if self.twitter_api is None:
             self.init_twitter()
         try:
-            status = self.twitter_api.PostUpdate(message)
-        except twitter.error.TwitterError as why:
-            details = why[0][0]
-            # https://developer.twitter.com/en/support/twitter-api/error-troubleshooting#error-codes
-            code = details.get("code", None)
-            if code in [88, 130]:
-                if retry_count < self.RETRY_MAX:
-                    self.warn(f"{details.get('message', 'Unknown issue')}. Retrying.")
-                    time.sleep(self.RETRY_DELAY)
-                    self.tweet(message, retry_count + 1)
-                else:
-                    self.warn(f"Exceeded max retries. Giving up.")
-            elif code == 187:
-                self.warn(f"Duplicate tweet '{message}'")
-            else:
-                raise
+            status = self.twitter_api.create_tweet(text=message)
+        except tweepy.HTTPException as why:
+            for message in why.api_messages:
+                self.warn(f"Tweet error: {message}")
+            raise  # not self.error, so we can remember what we read up to.
 
     def parse_args(self, argv):
         parser = argparse.ArgumentParser(
@@ -181,8 +175,7 @@ class DatatrackerTracker:
                 self.warn(f"Cannot open {self.args.last_seen_file} for reading: {why}")
                 sys.exit(1)
             except ValueError as why:
-                self.warn(f"Last seen file does not contain an integer: {why}")
-                sys.exit(1)
+                self.error(f"Last seen file does not contain an integer: {why}")
         return last_seen_id
 
     def write_last_seen(self, last_seen_id):
@@ -191,11 +184,10 @@ class DatatrackerTracker:
                 with open(self.args.last_seen_file, "w") as fh:
                     fh.write(str(last_seen_id))
             except IOError as why:
-                self.warn(f"Cannot open {self.args.last_seen_file} for writing: {why}")
-                sys.exit(1)
+                self.error(f"Cannot open {self.args.last_seen_file} for writing: {why}")
 
     def get_doc(self, doc_url):
-        self.note(f"Fetching <{doc_url}>")
+        self.note(f"Fetching: <{doc_url}>")
         try:
             req = requests.get(self.API_BASE + doc_url, timeout=15)
         except requests.exceptions.RequestException as why:
@@ -215,6 +207,10 @@ class DatatrackerTracker:
 
     def warn(self, message):
         sys.stderr.write(f"WARNING: {message}\n")
+
+    def error(self, message):
+        sys.stderr.write(f"ERROR: {message}\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
